@@ -47,20 +47,47 @@ namespace randomx {
 
 	class Service {
 	public:
-		Service(size_t, int);
+		// seedSlots: number of concurrently-held seed/cache/dataset slots
+		// (default ServicePrivate::DefaultSeedSlots, i.e. 3). See -seeds in
+		// main.cpp.
+		Service(size_t threads, int flags, size_t seedSlots = 0);
 		~Service();
 		bool run(const char* hostname, int port);
 		randomx_vm* createMachine() const;
 		void destroyMachine(randomx_vm* machine) const;
 		void refreshMachine(randomx_vm* machine) const;
-		void reinitCache(const void* seed, size_t seedSize);
-		void reinitDataset();
+
+		// Multi-seed slot management (see doc/API.md and service_private.h
+		// for the eviction policy). Returns true if seed bytes were not
+		// already resident in any slot and reinitSlot() must be called with
+		// the returned victim slot index; returns false (no work needed,
+		// fast path) if the seed was already primed in an existing slot.
+		bool touchSeed(const void* seed, size_t seedSize, size_t& victimSlot);
+		// Actually reinitializes ONLY the given slot's cache+dataset with
+		// the new seed. Only ever called after touchSeed() returns true and
+		// all worker threads have been drained idle by ThreadPool::reseed,
+		// so it never races with in-flight hashing against that slot.
+		void reinitSlot(size_t slot, const void* seed, size_t seedSize);
+		void reinitDataset(size_t slot);
+
+		// Resolves which slot a /hash or /batch request should use. Returns
+		// the slot index, or -1 if the request's RandomX-Seed header (if
+		// present) doesn't match any currently-primed slot. If no header is
+		// present, resolves to the most-recently-activated slot (matches
+		// pre-multi-slot behavior for single-seed clients).
+		int resolveSlotForRequest(const httplib::Request& req);
+		// Points a worker's VM at the given slot's cache/dataset, skipping
+		// the (cheap, but non-free) randomx_vm_set_cache/dataset call if the
+		// worker's VM is already pointed there.
+		void bindWorkerToSlot(ServiceWorker& worker, int slot) const;
+
 		bool checkSeed(const httplib::Request& req);
 		void setOrigin(const std::string& origin);
 		void enableLog();
 		bool allowCors(const char* method, const httplib::Request& req, httplib::Response& res);
 		static int getAutoFlags();
 		static int getMachineThreads();
+		static size_t getDefaultSeedSlots();
 		int getFlags() const;
 	private:
 		std::unique_ptr<ServicePrivate> data_;

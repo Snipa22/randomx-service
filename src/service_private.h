@@ -33,6 +33,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <iostream>
 #include <climits>
 #include <string>
+#include <vector>
+#include <mutex>
 #include "../RandomX/src/randomx.h"
 #include "httplib.h"
 #include "thread_pool.h"
@@ -42,37 +44,68 @@ namespace randomx {
 	class Service;
 	class ServiceWorker;
 
+	// A single seed's worth of primed RandomX state. Multiple slots let the
+	// service hold several independent seeds concurrently instead of the
+	// original single-cache/single-dataset design, which forced a full
+	// (expensive, memory-hard) reseed any time a request's seed differed
+	// from whatever was currently active.
+	struct SeedSlot {
+		randomx_cache* cache = nullptr;
+		randomx_dataset* dataset = nullptr;
+		std::string seedHex;
+		bool initialized = false;
+		// Monotonically increasing "logical timestamp" of last use, drawn
+		// from ServicePrivate::lruClock_. Used to implement least-recently-
+		// used eviction across slots. Not a wall-clock value.
+		uint64_t lastUsed = 0;
+	};
+
 	struct ServicePrivate {
 		static const int AutoFlags = INT_MAX;
-		ServicePrivate(Service& svc, int threads, int flags)
+		// Default number of concurrently-held seed slots when the caller
+		// (main.cpp's -seeds flag) doesn't specify one explicitly.
+		static const size_t DefaultSeedSlots = 3;
+
+		ServicePrivate(Service& svc, int threads, int flags, size_t seedSlots = DefaultSeedSlots)
 			:
 			server_([&svc, threads] { return new ThreadPool(svc, threads); }),
-			cache_(nullptr),
-			dataset_(nullptr),
 			threads_(threads),
-			initialized_(false)
+			initialized_(false),
+			currentSlot_(0),
+			lruClock_(0)
 		{
+			if (seedSlots == 0) {
+				seedSlots = 1;
+			}
+
 			bool autoFlags = flags == AutoFlags;
 			if (autoFlags) {
 				flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM | RANDOMX_FLAG_LARGE_PAGES;
 			}
-			cache_ = randomx_alloc_cache((randomx_flags)flags);
-			if (autoFlags && cache_ == nullptr) {
+
+			// Probe allocation behavior using the first slot; the same flags
+			// are then reused (without re-probing) for the remaining slots,
+			// since RandomX flags are a service-wide setting, not a per-slot
+			// one.
+			randomx_cache* probeCache = randomx_alloc_cache((randomx_flags)flags);
+			if (autoFlags && probeCache == nullptr) {
 				std::cout << "RANDOMX_FLAG_LARGE_PAGES was not successful (randomx_cache)" << std::endl;
 				flags &= ~RANDOMX_FLAG_LARGE_PAGES;
-				cache_ = randomx_alloc_cache((randomx_flags)flags);
+				probeCache = randomx_alloc_cache((randomx_flags)flags);
 			}
-			if (cache_ == nullptr) {
+			if (probeCache == nullptr) {
 				throw std::runtime_error("randomx_alloc_cache failed");
 			}
+
+			randomx_dataset* probeDataset = nullptr;
 			if (flags & RANDOMX_FLAG_FULL_MEM) {
-				dataset_ = randomx_alloc_dataset((randomx_flags)flags);
-				if (dataset_ == nullptr) {
+				probeDataset = randomx_alloc_dataset((randomx_flags)flags);
+				if (probeDataset == nullptr) {
 					if (autoFlags) {
 						std::cout << "RANDOMX_FLAG_LARGE_PAGES was not successful (randomx_dataset)" << std::endl;
 						flags &= ~RANDOMX_FLAG_LARGE_PAGES;
-						dataset_ = randomx_alloc_dataset((randomx_flags)flags);
-						if (dataset_ == nullptr) {
+						probeDataset = randomx_alloc_dataset((randomx_flags)flags);
+						if (probeDataset == nullptr) {
 							std::cout << "RANDOMX_FLAG_FULL_MEM was not successful" << std::endl;
 							flags &= ~RANDOMX_FLAG_FULL_MEM;
 						}
@@ -83,26 +116,56 @@ namespace randomx {
 				}
 			}
 			flags_ = (randomx_flags)flags;
+
+			slots_.resize(seedSlots);
+			slots_[0].cache = probeCache;
+			slots_[0].dataset = probeDataset;
+
+			for (size_t i = 1; i < seedSlots; ++i) {
+				slots_[i].cache = randomx_alloc_cache(flags_);
+				if (slots_[i].cache == nullptr) {
+					throw std::runtime_error("randomx_alloc_cache failed for seed slot");
+				}
+				if (flags_ & RANDOMX_FLAG_FULL_MEM) {
+					slots_[i].dataset = randomx_alloc_dataset(flags_);
+					if (slots_[i].dataset == nullptr) {
+						throw std::runtime_error("randomx_alloc_dataset failed for seed slot");
+					}
+				}
+			}
 		}
 
 		~ServicePrivate() {
-			if (cache_ != nullptr) {
-				randomx_release_cache(cache_);
-			}
-			if (dataset_ != nullptr) {
-				randomx_release_dataset(dataset_);
+			for (auto& slot : slots_) {
+				if (slot.cache != nullptr) {
+					randomx_release_cache(slot.cache);
+				}
+				if (slot.dataset != nullptr) {
+					randomx_release_dataset(slot.dataset);
+				}
 			}
 		}
 
-		randomx_dataset* dataset_;
-		randomx_cache* cache_;
+		std::vector<SeedSlot> slots_;
 		httplib::Server<ServiceWorker> server_;
 		randomx_flags flags_;
 		size_t threads_;
-		std::string seedHex_;
 		std::string origin_;
 		bool initialized_;
 		std::atomic<uint64_t> hashes_;
+
+		// Index of the most-recently activated slot. Used for backward
+		// compatibility with requests/clients that don't send a
+		// RandomX-Seed header (they get "whatever was primed last", exactly
+		// matching the pre-multi-slot behavior) and for the legacy `seed`
+		// field of GET /info.
+		size_t currentSlot_;
+
+		// Logical clock used to timestamp slot usage for LRU eviction.
+		// Guarded by slotsMutex_ together with the mutable fields of each
+		// SeedSlot (seedHex, initialized, lastUsed).
+		uint64_t lruClock_;
+		std::mutex slotsMutex_;
 	};
 
 }
