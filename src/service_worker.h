@@ -55,6 +55,13 @@ namespace randomx {
 		std::condition_variable cond_;
 		std::mutex mutex_;
 		unsigned id_;
+		// Which seed slot vm_ is currently pointed at (-1 = not yet bound
+		// to any particular slot beyond the initial slot 0 given at
+		// creation). Lets Service::bindWorkerToSlot skip a redundant
+		// randomx_vm_set_cache/dataset call when consecutive jobs on this
+		// worker use the same slot. Only ever read/written by the worker's
+		// own thread while it is processing a job, so no locking is needed.
+		int currentSlot_ = -1;
 	};
 
 }

@@ -38,6 +38,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <iostream>
 #include <array>
 #include <sstream>
+#include <algorithm>
 
 namespace randomx {
 
@@ -64,7 +65,7 @@ namespace randomx {
 	}
 
 	randomx_vm* Service::createMachine() const {
-		auto* machine = randomx_create_vm(data_->flags_, data_->cache_, data_->dataset_);
+		auto* machine = randomx_create_vm(data_->flags_, data_->slots_[0].cache, data_->slots_[0].dataset);
 		if (machine == nullptr) {
 			throw std::runtime_error("randomx_create_vm failed");
 		}
@@ -76,14 +77,20 @@ namespace randomx {
 	}
 
 	void Service::refreshMachine(randomx_vm* machine) const {
+		// NOTE: superseded by bindWorkerToSlot's cheap per-request VM
+		// re-pointing (see thread_pool.cpp's ThreadPool::reseed) -- kept
+		// only because it's still part of this class's public API surface;
+		// no current caller invokes this. Left hardcoded to slot 0 since
+		// it has no real caller to reason about beyond that.
 		if (data_->flags_ & RANDOMX_FLAG_FULL_MEM) {
-			randomx_vm_set_dataset(machine, data_->dataset_);
+			randomx_vm_set_dataset(machine, data_->slots_[0].dataset);
 		} else {
-			randomx_vm_set_cache(machine, data_->cache_);
+			randomx_vm_set_cache(machine, data_->slots_[0].cache);
 		}
 	}
 
-	void Service::reinitDataset() {
+	void Service::reinitDataset(size_t slot) {
+		auto& s = data_->slots_[slot];
 		if (data_->flags_ & RANDOMX_FLAG_FULL_MEM) {
 			uint32_t datasetItemCount = randomx_dataset_item_count();
 			auto threads = data_->threads_;
@@ -94,7 +101,7 @@ namespace randomx {
 				uint32_t startItem = 0;
 				for (int i = 0; i < threads; ++i) {
 					auto count = perThread + (i == threads - 1 ? remainder : 0);
-					workers.push_back(std::thread(&randomx_init_dataset, data_->dataset_, data_->cache_, startItem, count));
+					workers.push_back(std::thread(&randomx_init_dataset, s.dataset, s.cache, startItem, count));
 					startItem += count;
 				}
 				for (unsigned i = 0; i < workers.size(); ++i) {
@@ -102,7 +109,7 @@ namespace randomx {
 				}
 			}
 			else {
-				randomx_init_dataset(data_->dataset_, data_->cache_, 0, datasetItemCount);
+				randomx_init_dataset(s.dataset, s.cache, 0, datasetItemCount);
 			}
 		}
 	}
@@ -132,6 +139,10 @@ namespace randomx {
 
 	int Service::getMachineThreads() {
 		return std::thread::hardware_concurrency();
+	}
+
+	size_t Service::getDefaultSeedSlots() {
+		return ServicePrivate::DefaultSeedSlots;
 	}
 
 	bool readRequestBody(const httplib::Request& req, httplib::Response& res, std::vector<char>& body) {
@@ -218,20 +229,116 @@ namespace randomx {
 	}
 
 	bool Service::checkSeed(const httplib::Request& req) {
+		return resolveSlotForRequest(req) >= 0;
+	}
+
+	// touchSeed / reinitSlot implement the actual multi-seed-slot logic.
+	//
+	// Eviction policy: Least Recently Used (LRU) across the N configured
+	// slots, tracked via a simple monotonic logical clock (lruClock_) that
+	// is bumped every time a slot is matched/activated. An empty
+	// (never-yet-initialized) slot is always preferred over evicting an
+	// already-primed one, so the first N distinct seeds fill all slots
+	// without evicting each other; only the (N+1)th distinct seed causes a
+	// real eviction. This is the standard, simplest-to-reason-about policy
+	// for a small, fixed number of slots and matches the "2 slots enables a
+	// clean old/new handoff, 3 avoids edge-case thrashing" rationale this
+	// feature was built for.
+	bool Service::touchSeed(const void* seed, size_t seedSize, size_t& victimSlot) {
+		std::string seedHex = bin2hex((const char*)seed, seedSize);
+		std::lock_guard<std::mutex> lock(data_->slotsMutex_);
+		for (size_t i = 0; i < data_->slots_.size(); ++i) {
+			auto& slot = data_->slots_[i];
+			if (slot.initialized && slot.seedHex == seedHex) {
+				// Fast path: seed is already resident in its own slot.
+				// No reinit needed -- this is the entire point of the
+				// feature: switching between already-primed seeds must not
+				// trigger an expensive full reseed.
+				slot.lastUsed = ++data_->lruClock_;
+				data_->currentSlot_ = i;
+				data_->initialized_ = true;
+				return false;
+			}
+		}
+
+		// Not resident anywhere: pick an eviction victim. Prefer an empty
+		// slot; otherwise evict whichever initialized slot has the smallest
+		// lastUsed value (the LRU one).
+		size_t victim = 0;
+		bool foundEmpty = false;
+		uint64_t oldest = UINT64_MAX;
+		for (size_t i = 0; i < data_->slots_.size(); ++i) {
+			if (!data_->slots_[i].initialized) {
+				victim = i;
+				foundEmpty = true;
+				break;
+			}
+			if (data_->slots_[i].lastUsed < oldest) {
+				oldest = data_->slots_[i].lastUsed;
+				victim = i;
+			}
+		}
+		(void)foundEmpty;
+		// Mark the victim invalid immediately so no other request can be
+		// routed to (or believe it matches) this slot while the caller
+		// performs the actual (expensive, lock-free) reinit work below.
+		data_->slots_[victim].initialized = false;
+		victimSlot = victim;
+		return true;
+	}
+
+	void Service::reinitSlot(size_t slot, const void* seed, size_t seedSize) {
+		auto& s = data_->slots_[slot];
+		randomx_init_cache(s.cache, seed, seedSize);
+		reinitDataset(slot);
+		std::string seedHex = bin2hex((const char*)seed, seedSize);
+		{
+			std::lock_guard<std::mutex> lock(data_->slotsMutex_);
+			s.seedHex = seedHex;
+			s.initialized = true;
+			s.lastUsed = ++data_->lruClock_;
+			data_->currentSlot_ = slot;
+			data_->initialized_ = true;
+		}
+	}
+
+	int Service::resolveSlotForRequest(const httplib::Request& req) {
+		std::lock_guard<std::mutex> lock(data_->slotsMutex_);
 		if (req.has_header(HEADER_RANDOMX_SEED)) {
 			auto seed = req.get_header_value(HEADER_RANDOMX_SEED);
 			for (char& c : seed) {
 				c = std::tolower(c);
 			}
-			return seed == data_->seedHex_;
+			for (size_t i = 0; i < data_->slots_.size(); ++i) {
+				auto& slot = data_->slots_[i];
+				if (slot.initialized && slot.seedHex == seed) {
+					slot.lastUsed = ++data_->lruClock_;
+					return (int)i;
+				}
+			}
+			return -1;
 		}
-		return true;
+		// No RandomX-Seed header: fall back to whichever slot was most
+		// recently activated, matching the pre-multi-slot behavior where
+		// there was only ever one seed to fall back to.
+		auto& current = data_->slots_[data_->currentSlot_];
+		if (current.initialized) {
+			return (int)data_->currentSlot_;
+		}
+		return -1;
 	}
 
-	void Service::reinitCache(const void* seed, size_t seedSize) {
-		randomx_init_cache(data_->cache_, seed, seedSize);
-		data_->seedHex_ = bin2hex((const char*)seed, seedSize);
-		data_->initialized_ = true;
+	void Service::bindWorkerToSlot(ServiceWorker& worker, int slot) const {
+		if (worker.currentSlot_ == slot) {
+			return;
+		}
+		auto& s = data_->slots_[slot];
+		if (data_->flags_ & RANDOMX_FLAG_FULL_MEM) {
+			randomx_vm_set_dataset(worker.vm_, s.dataset);
+		} else {
+			randomx_vm_set_cache(worker.vm_, s.cache);
+		}
+		worker.currentSlot_ = slot;
 	}
 
 	void Service::enableLog() {
@@ -295,8 +402,8 @@ namespace randomx {
 		}
 	}
 
-	Service::Service(size_t threads, int flags) :
-		data_(new ServicePrivate(*this, threads, flags))
+	Service::Service(size_t threads, int flags, size_t seedSlots) :
+		data_(new ServicePrivate(*this, threads, flags, seedSlots == 0 ? ServicePrivate::DefaultSeedSlots : seedSlots))
 	{
 		auto options = [&](ServiceWorker& w, const httplib::Request& req, httplib::Response& res) {
 			if (!allowCors("POST", req, res)) {
@@ -312,17 +419,46 @@ namespace randomx {
 				allowCors("GET", req, res);
 				std::stringstream info;
 				info << "{\n";
-				info << "\t\"randomx_service\": \"v" RANDOMX_SERVICE_VERSION "\",\n";
-				info << "\t\"algorithm\": \"" SERVICE_ALGORITHM "\",\n";
-				info << "\t\"threads\": " << data_->threads_ << ",\n";
-				info << "\t\"seed\": ";
+				info << "	\"randomx_service\": \"v" RANDOMX_SERVICE_VERSION "\",\n";
+				info << "	\"algorithm\": \"" SERVICE_ALGORITHM "\",\n";
+				info << "	\"threads\": " << data_->threads_ << ",\n";
+				info << "	\"seed\": ";
+				// Backward-compatible: "seed" keeps reporting a single hex
+				// string (the most-recently-activated slot's seed) or null,
+				// exactly like the pre-multi-slot wire format, so existing
+				// clients (e.g. go-xmr-lib's RXVerifier.Info()) keep
+				// working unchanged.
 				if (data_->initialized_) {
-					info << "\"" << data_->seedHex_ << "\"";
+					info << "\"" << data_->slots_[data_->currentSlot_].seedHex << "\"";
 				}
 				else {
 					info << "null";
 				}
-				info << ",\n\t\"hashes\": " << data_->hashes_.load() << "\n";
+				// New, additive field: every currently-primed seed across
+				// all slots, in most-recently-used-first order. New
+				// clients can use this to discover multi-seed support;
+				// old clients simply ignore the unknown field.
+				info << ",\n	\"seeds\": [";
+				{
+					std::vector<size_t> order;
+					for (size_t i = 0; i < data_->slots_.size(); ++i) {
+						if (data_->slots_[i].initialized) {
+							order.push_back(i);
+						}
+					}
+					std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+						return data_->slots_[a].lastUsed > data_->slots_[b].lastUsed;
+					});
+					for (size_t i = 0; i < order.size(); ++i) {
+						if (i > 0) {
+							info << ", ";
+						}
+						info << "\"" << data_->slots_[order[i]].seedHex << "\"";
+					}
+				}
+				info << "],\n";
+				info << "	\"seed_slots\": " << data_->slots_.size() << ",\n";
+				info << "	\"hashes\": " << data_->hashes_.load() << "\n";
 				info << "}\n";
 				res.set_content(info.str(), "application/json");
 			})
@@ -349,10 +485,12 @@ namespace randomx {
 				if (!readRequestBody(req, res, body)) {
 					return;
 				}
-				if (!checkSeed(req)) {
+				int slot = resolveSlotForRequest(req);
+				if (slot < 0) {
 					res.status = 422;
 					return;
 				}
+				bindWorkerToSlot(w, slot);
 				RandomxHash hash;
 				randomx_calculate_hash(w.vm_, body.data(), body.size(), hash.data());
 				data_->hashes_.fetch_add(1);
@@ -368,10 +506,12 @@ namespace randomx {
 				if (!readRequestBatch(req, res, batch)) {
 					return;
 				}
-				if (!checkSeed(req)) {
+				int slot = resolveSlotForRequest(req);
+				if (slot < 0) {
 					res.status = 422;
 					return;
 				}
+				bindWorkerToSlot(w, slot);
 				std::vector<RandomxHash> hashes;
 				hashes.resize(batch.size());
 				randomx_calculate_hash_first(w.vm_, batch[0].data(), batch[0].size());

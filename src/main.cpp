@@ -39,6 +39,7 @@ void printUsage(const char* exe) {
 		<< "  -port <number>     Bind to a specific port (default: 39093)" << std::endl
 		<< "  -threads <number>  Use a specific number of threads (default: all CPU threads)" << std::endl
 		<< "  -flags <number>    Use specific RandomX flags (default: auto)" << std::endl
+		<< "  -seeds <number>    Number of concurrently-held seed/cache/dataset slots (default: 3)" << std::endl
 		<< "  -origin <string>   Allow cross-origin requests from a specific web page" << std::endl
 		<< "  -log               Log all HTTP requests to stdout" << std::endl
 		<< "  -help              Display this message" << std::endl;
@@ -46,13 +47,14 @@ void printUsage(const char* exe) {
 
 int main(int argc, char** argv) {
 	std::string host, origin;
-	int port, threads, flags;
+	int port, threads, flags, seeds;
 	bool help, log;
 
 	readStringOption("-host", argc, argv, host, "localhost");
 	readIntOption("-port", argc, argv, port, 39093);
 	readIntOption("-threads", argc, argv, threads, randomx::Service::getMachineThreads());
 	readIntOption("-flags", argc, argv, flags, randomx::Service::getAutoFlags());
+	readIntOption("-seeds", argc, argv, seeds, (int)randomx::Service::getDefaultSeedSlots());
 	readStringOption("-origin", argc, argv, origin, "");
 	readOption("-log", argc, argv, log);
 	readOption("-help", argc, argv, help);
@@ -62,10 +64,15 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 
+	if (seeds < 1) {
+		std::cout << "ERROR: -seeds must be at least 1" << std::endl;
+		return 1;
+	}
+
 	try {
 		std::cout << "Initializing service..." << std::endl;
-		randomx::Service svc(threads, flags);
-		std::cout << "Threads: " << threads << ", Flags: " << svc.getFlags() << std::endl;
+		randomx::Service svc(threads, flags, (size_t)seeds);
+		std::cout << "Threads: " << threads << ", Flags: " << svc.getFlags() << ", Seed slots: " << seeds << std::endl;
 		if (!origin.empty()) {
 			std::cout << "Setting origin to " << origin << std::endl;
 			svc.setOrigin(origin);

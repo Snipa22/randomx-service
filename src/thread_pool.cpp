@@ -67,24 +67,40 @@ namespace randomx {
 	}
 
 	void ThreadPool::reseed(ServiceWorker& self, const void* seed, size_t length) {
-		//set the reseed variable; this stops pending requests from being processed
+		//Fast path: if this seed is already resident in one of the service's
+		//seed slots, just bump its LRU timestamp and return -- no worker
+		//needs to be drained and no cache/dataset touched. This is the
+		//actual fix for the original single-seed thrashing problem: two
+		//callers alternating between N<=slots distinct seeds never pay a
+		//full reseed after the first time each seed is primed.
+		size_t victimSlot;
+		if (!svc_.touchSeed(seed, length, victimSlot)) {
+			return;
+		}
+
+		//Slow path: the seed isn't resident in any slot, so a real eviction
+		//is required. set the reseed variable; this stops pending requests
+		//from being processed
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
 			reseeding_ = true;
 		}
 		//wait until all workers are idle (except of the worker who is running this code)
+		//this guarantees no worker is mid-hash against the victim slot's
+		//cache/dataset before we start overwriting its contents below.
 		for (auto& worker : workers_) {
 			if (&self != worker.get()) {
 				worker->waitIdle();
 			}
 		}
-		//reinitialize the cache and dataset
-		svc_.reinitCache(seed, length);
-		svc_.reinitDataset();
-		//refresh workers
-		for (auto& worker : workers_) {
-			svc_.refreshMachine(worker->vm_);
-		}
+		//reinitialize ONLY the victim slot's cache and dataset; every other
+		//slot's already-primed state is left completely untouched.
+		svc_.reinitSlot(victimSlot, seed, length);
+		//note: worker VMs are NOT proactively refreshed here -- each worker
+		//re-points its own VM (cheaply, via randomx_vm_set_cache/dataset)
+		//to whichever slot a given /hash or /batch request actually needs,
+		//right before computing that request's hash. See
+		//Service::bindWorkerToSlot.
 		//notify workers
 		reseeding_ = false;
 		cond_.notify_all();
