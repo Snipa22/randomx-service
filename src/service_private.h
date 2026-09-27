@@ -122,14 +122,45 @@ namespace randomx {
 			slots_[0].dataset = probeDataset;
 
 			for (size_t i = 1; i < seedSlots; ++i) {
-				slots_[i].cache = randomx_alloc_cache(flags_);
+				// Slot 0 (the probe above) may get "lucky" and succeed with
+				// RANDOMX_FLAG_LARGE_PAGES even when the kernel's hugepage
+				// pool is nearly exhausted (e.g. right after a restart, with
+				// another process's pages not yet released). A later slot's
+				// allocation can still fail under that same flag. Mirror the
+				// probe's own graceful degradation here instead of throwing
+				// on the first failure: retry with large pages stripped
+				// (and, if the dataset alloc still fails, with full-mem
+				// stripped too) before giving up.
+				randomx_flags slotFlags = flags_;
+
+				slots_[i].cache = randomx_alloc_cache(slotFlags);
+				if (slots_[i].cache == nullptr && (slotFlags & RANDOMX_FLAG_LARGE_PAGES)) {
+					std::cout << "RANDOMX_FLAG_LARGE_PAGES was not successful (randomx_cache, seed slot " << i << ")" << std::endl;
+					slotFlags = (randomx_flags)(slotFlags & ~RANDOMX_FLAG_LARGE_PAGES);
+					slots_[i].cache = randomx_alloc_cache(slotFlags);
+				}
 				if (slots_[i].cache == nullptr) {
 					throw std::runtime_error("randomx_alloc_cache failed for seed slot");
 				}
+
 				if (flags_ & RANDOMX_FLAG_FULL_MEM) {
-					slots_[i].dataset = randomx_alloc_dataset(flags_);
+					slots_[i].dataset = randomx_alloc_dataset(slotFlags);
+					if (slots_[i].dataset == nullptr && (slotFlags & RANDOMX_FLAG_LARGE_PAGES)) {
+						std::cout << "RANDOMX_FLAG_LARGE_PAGES was not successful (randomx_dataset, seed slot " << i << ")" << std::endl;
+						slotFlags = (randomx_flags)(slotFlags & ~RANDOMX_FLAG_LARGE_PAGES);
+						slots_[i].dataset = randomx_alloc_dataset(slotFlags);
+					}
 					if (slots_[i].dataset == nullptr) {
-						throw std::runtime_error("randomx_alloc_dataset failed for seed slot");
+						// Even plain-page allocation failed (genuine memory
+						// exhaustion, not just a hugepage shortage). Clear
+						// RANDOMX_FLAG_FULL_MEM service-wide -- Service::
+						// createMachine()/bindWorkerToSlot() branch on the
+						// shared flags_ (not a per-slot value) to decide
+						// whether to bind a dataset or a cache, so this slot
+						// running cache-only must be reflected globally to
+						// avoid handing a null dataset to randomx_vm_set_dataset.
+						std::cout << "RANDOMX_FLAG_FULL_MEM was not successful for seed slot " << i << std::endl;
+						flags_ = (randomx_flags)(flags_ & ~RANDOMX_FLAG_FULL_MEM);
 					}
 				}
 			}
