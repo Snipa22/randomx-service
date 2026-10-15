@@ -48,3 +48,26 @@ set_property(TARGET randomx-service PROPERTY CXX_STANDARD 11)
 target_link_libraries(${PROJECT_NAME}
   PRIVATE randomx
   PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+
+# Regression test for the ThreadPool::reseed() mutual-deadlock incident.
+# Shares the same service/thread-pool/worker sources as the main binary
+# (minus main.cpp) so it exercises the real production code path through
+# the real HTTP server, not a mock.
+enable_testing()
+
+add_executable(randomx-service-reseed-test
+src/test_reseed_deadlock.cpp
+src/service.cpp
+src/service_worker.cpp
+src/thread_pool.cpp)
+
+set_property(TARGET randomx-service-reseed-test PROPERTY CXX_STANDARD 11)
+
+target_link_libraries(randomx-service-reseed-test
+  PRIVATE randomx
+  PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+
+add_test(NAME reseed_deadlock_regression COMMAND randomx-service-reseed-test)
+# The test enforces its own ~30s hard watchdog internally; give ctest a
+# little extra headroom on top of that before it also steps in.
+set_tests_properties(reseed_deadlock_regression PROPERTIES TIMEOUT 45)
