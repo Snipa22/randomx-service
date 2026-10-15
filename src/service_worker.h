@@ -49,6 +49,15 @@ namespace randomx {
 
 		void waitIdle();
 
+		// Explicitly set this worker's idle_ flag and wake any sibling
+		// blocked in waitIdle() on it. Used by ThreadPool::reseed() to let
+		// a worker that is blocked waiting for the single-flight
+		// reseedMutex_ (rather than genuinely busy hashing) present as
+		// idle to a sibling's drain loop -- see the comment in reseed()
+		// for why this is required to avoid a deadlock between two
+		// concurrent reseed() calls.
+		void setIdle(bool idle);
+
 		randomx_vm* vm_;
 		ThreadPool& pool_;
 		bool idle_;

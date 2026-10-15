@@ -72,4 +72,12 @@ namespace randomx {
 		cond_.wait(
 			lock, [&] { return idle_; });
 	}
+
+	void ServiceWorker::setIdle(bool idle) {
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			idle_ = idle;
+		}
+		cond_.notify_all();
+	}
 }

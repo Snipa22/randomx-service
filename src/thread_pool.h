@@ -71,6 +71,15 @@ namespace randomx {
 
 		std::condition_variable cond_;
 		std::mutex mutex_;
+
+		// Single-flight guard for the "decide whether a real reseed is
+		// needed, drain siblings idle, reinit the victim slot" sequence
+		// in reseed(). Deliberately a *separate* mutex from mutex_ (which
+		// only ever guards jobs_/reseeding_/shutdown_ for brief,
+		// non-blocking critical sections) -- see the long comment in
+		// reseed() for why this one has to be held across a
+		// potentially-blocking wait and why that's still deadlock-free.
+		std::mutex reseedMutex_;
 	};
 
 }
